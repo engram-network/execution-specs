@@ -1,0 +1,248 @@
+"""
+Ethereum Forks
+^^^^^^^^^^^^^^
+
+Detects Python packages that specify Ethereum hardforks.
+"""
+
+import importlib
+import pkgutil
+from enum import Enum, auto
+from pkgutil import ModuleInfo
+from types import ModuleType
+from typing import Any, Dict, Iterator, List, Optional, Type, TypeVar
+
+import ethereum
+from ethereum.fork_criteria import ByBlockNumber, ByTimestamp, ForkCriteria
+
+
+class ConsensusType(Enum):
+    """
+    How a fork chooses its canonical chain.
+    """
+
+    PROOF_OF_WORK = auto()
+    PROOF_OF_STAKE = auto()
+
+    def is_pow(self) -> bool:
+        """
+        Returns True if self == PROOF_OF_WORK.
+        """
+        return self == ConsensusType.PROOF_OF_WORK
+
+    def is_pos(self) -> bool:
+        """
+        Returns True if self == PROOF_OF_STAKE.
+        """
+        return self == ConsensusType.PROOF_OF_STAKE
+
+
+H = TypeVar("H", bound="Hardfork")
+
+
+class Hardfork:
+    """
+    Metadata associated with an Ethereum hardfork.
+    """
+
+    mod: ModuleType
+
+    @classmethod
+    def discover(cls: Type[H]) -> List[H]:
+        """
+        Find packages which contain Ethereum hardfork specifications.
+        """
+        path = getattr(ethereum, "__path__", None)
+        if path is None:
+            raise ValueError("module `ethereum` has no path information")
+
+        modules = pkgutil.iter_modules(path, ethereum.__name__ + ".")
+        modules = (module for module in modules if module.ispkg)
+        forks: List[H] = []
+
+        for pkg in modules:
+            mod = importlib.import_module(pkg.name)
+
+            if hasattr(mod, "FORK_CRITERIA"):
+                forks.append(cls(mod))
+
+        # Timestamps are bigger than block numbers, so this always works.
+        forks.sort(key=lambda fork: fork.criteria)
+
+        return forks
+
+    @classmethod
+    def load(cls: Type[H], config_dict: Dict[ForkCriteria, str]) -> List[H]:
+        """
+        Load the forks from a config dict specifying fork blocks and
+        timestamps.
+        """
+        config = sorted(config_dict.items(), key=lambda x: x[0])
+
+        forks = []
+
+        for (criteria, name) in config:
+            mod = importlib.import_module("ethereum." + name)
+            mod.FORK_CRITERIA = criteria  # type: ignore
+            forks.append(cls(mod))
+
+        return forks
+
+    @classmethod
+    def load_from_json(cls: Type[H], json: Any) -> List[H]:
+        """
+        Load fork config from the json format used by Geth.
+
+        Does not support some forks that only exist on Mainnet. Use
+        `discover()` for Mainnet.
+        """
+        c = json["config"]
+        config = {
+            ByBlockNumber(0): "frontier",
+            ByBlockNumber(c["homesteadBlock"]): "homestead",
+            ByBlockNumber(c["eip150Block"]): "tangerine_whistle",
+            ByBlockNumber(c["eip155Block"]): "spurious_dragon",
+            ByBlockNumber(c["byzantiumBlock"]): "byzantium",
+            ByBlockNumber(c["constantinopleBlock"]): "constantinople",
+            ByBlockNumber(c["istanbulBlock"]): "istanbul",
+            ByBlockNumber(c["berlinBlock"]): "berlin",
+            ByBlockNumber(c["londonBlock"]): "london",
+            ByBlockNumber(c["mergeForkBlock"]): "paris",
+            ByTimestamp(c["shanghaiTime"]): "shanghai",
+        }
+
+        if "daoForkBlock" in c:
+            raise Exception(
+                "Hardfork.load_from_json() does not support Mainnet"
+            )
+
+        return cls.load(config)
+
+    def __init__(self, mod: ModuleType) -> None:
+        self.mod = mod
+
+    @property
+    def consensus(self) -> ConsensusType:
+        """
+        How this fork chooses its canonical chain.
+        """
+        if hasattr(self.module("fork"), "validate_proof_of_work"):
+            return ConsensusType.PROOF_OF_WORK
+        else:
+            return ConsensusType.PROOF_OF_STAKE
+
+    @property
+    def criteria(self) -> ForkCriteria:
+        """
+        Criteria to trigger this hardfork.
+        """
+        criteria = self.mod.FORK_CRITERIA  # type: ignore[attr-defined]
+        assert isinstance(criteria, ForkCriteria)
+        return criteria
+
+    @property
+    def block(self) -> int:
+        """
+        Block number of the first block in this hard fork.
+        """
+        if isinstance(self.criteria, ByBlockNumber):
+            return self.criteria.block_number
+        else:
+            raise AttributeError
+
+    @property
+    def timestamp(self) -> int:
+        """
+        Block number of the first block in this hard fork.
+        """
+        if isinstance(self.criteria, ByTimestamp):
+            return self.criteria.timestamp
+        else:
+            raise AttributeError
+
+    def has_activated(self, block_number: int, timestamp: int) -> bool:
+        """
+        Check whether this fork has activated.
+        """
+        return self.criteria.check(block_number, timestamp)
+
+    @property
+    def path(self) -> Optional[str]:
+        """
+        Path to the module containing this hard fork.
+        """
+        return getattr(self.mod, "__path__", None)
+
+    @property
+    def short_name(self) -> str:
+        """
+        Short name (without the `ethereum.` prefix) of the hard fork.
+        """
+        return self.mod.__name__.split(".")[-1]
+
+    @property
+    def name(self) -> str:
+        """
+        Name of the hard fork.
+        """
+        return self.mod.__name__
+
+    @property
+    def title_case_name(self) -> str:
+        """
+        Name of the hard fork.
+        """
+        return self.short_name.replace("_", " ").title()
+
+    def __repr__(self) -> str:
+        """
+        Return repr(self).
+        """
+        return (
+            self.__class__.__name__
+            + "("
+            + f"name={self.name!r}, "
+            + f"criteria={self.criteria}, "
+            + "..."
+            + ")"
+        )
+
+    def import_module(self) -> ModuleType:
+        """
+        Return the module containing this specification.
+        """
+        return self.mod
+
+    def module(self, name: str) -> Any:
+        """
+        Import if necessary, and return the given module belonging to this hard
+        fork.
+        """
+        return importlib.import_module(self.mod.__name__ + "." + name)
+
+    def optimized_module(self, name: str) -> Any:
+        """
+        Import if necessary, and return the given module belonging to this hard
+        fork's optimized implementation.
+        """
+        assert self.mod.__name__.startswith("ethereum.")
+        module = "ethereum_optimized" + self.mod.__name__[8:] + "." + name
+        return importlib.import_module(module)
+
+    def iter_modules(self) -> Iterator[ModuleInfo]:
+        """
+        Iterate through the (sub-)modules describing this hardfork.
+        """
+        if self.path is None:
+            raise ValueError(f"cannot walk {self.name}, path is None")
+
+        return pkgutil.iter_modules(self.path, self.name + ".")
+
+    def walk_packages(self) -> Iterator[ModuleInfo]:
+        """
+        Iterate recursively through the (sub-)modules describing this hardfork.
+        """
+        if self.path is None:
+            raise ValueError(f"cannot walk {self.name}, path is None")
+
+        return pkgutil.walk_packages(self.path, self.name + ".")
